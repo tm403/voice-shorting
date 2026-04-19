@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>声シューティング 完全版</title>
+<style>
+body{
+  margin:0;
+  background:#000;
+  overflow:hidden;
+  font-family:sans-serif;
+}
+canvas{
+  display:block;
+  margin:0 auto;
+  background:#111;
+}
+#start{
+  position:fixed;
+  inset:0;
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  align-items:center;
+  background:rgba(0,0,0,0.82);
+  color:#fff;
+  z-index:10;
+  text-align:center;
+  cursor:pointer;
+}
+#start h1{
+  margin:0 0 12px 0;
+  font-size:48px;
+  letter-spacing:4px;
+}
+#start p{
+  margin:6px 0;
+  font-size:18px;
+}
+#start .small{
+  font-size:14px;
+  color:#ccc;
+}
+#start .button{
+  margin-top:24px;
+  padding:14px 28px;
+  border:1px solid #fff;
+  font-size:18px;
+}
+</style>
+</head>
+<body>
+
+<div id="start">
+  <h1>VOICE SHOOT</h1>
+  <p>声で撃つシューティング</p>
+  <p class="small">マウスで移動 / 声でショット / 大声でビーム</p>
+  <p class="small">耳を撃ち落としてハイスコアを目指せ</p>
+  <div class="button">クリックして開始（マイク許可）</div>
+</div>
+<canvas id="c"></canvas>
+
+<script>
+const c = document.getElementById("c");
+const ctx = c.getContext("2d");
+c.width = 400;
+c.height = 600;
+
+const assets = {
+  background: "bg.jpg",
+  player: "player.png",
+  enemyWeak: "enemy_weak.png",
+  enemyStrong: "enemy_strong.png",
+  enemySplit: "enemy_split.png",
+  bullet: "bullet.png",
+  beamSound: "beam.mp3"
+};
+
+const images = {};
+const imageLoaded = {};
+let beamSound = null;
+
+let bullets = [];
+let enemies = [];
+let effects = [];
+let beams = [];
+let mouseX = 200;
+
+let audioLevel = 0;
+let smoothedAudioLevel = 0;
+let beamAudioLevel = 80;
+let barMaxAudioLevel = 90;
+
+let started = false;
+let gameOver = false;
+
+let shootCooldown = 0;
+let beamCooldown = 0;
+let score = 0;
+let hp = 3;
+let damageFlash = 0;
+let shake = 0;
+let SSpawnScore = 150;
+
+let weakSpawnTimer = 0;
+let strongSpawnTimer = 0;
+let splitSpawnTimer = 0;
+
+let lastTime = 0;
+let totalTime = 0;
+
+let highScore = Number(localStorage.getItem("voiceShootHighScore")) || 0;
+
+function randRange(min, max) {
+  return Math.random() * (max - min) + min;
+}
+
+function getDifficulty() {
+  return 1 + Math.min(totalTime / 180, 1.2);
+}
+
+function resetSpawnTimers() {
+  weakSpawnTimer = randRange(0.55, 0.95);
+  strongSpawnTimer = randRange(3.2, 5.0);
+  splitSpawnTimer = randRange(4.5, 7.0);
+}
+
+function loadAssets(callback) {
+  const imageKeys = ["background", "player", "enemyWeak", "enemyStrong", "enemySplit", "bullet"];
+  let finished = 0;
+
+  imageKeys.forEach(key => {
+    const img = new Image();
+
+    img.onload = () => {
+      images[key] = img;
+      imageLoaded[key] = true;
+      finished++;
+      if (finished === imageKeys.length) callback();
+    };
+
+    img.onerror = () => {
+      images[key] = null;
+      imageLoaded[key] = false;
+      finished++;
+      if (finished === imageKeys.length) callback();
+    };
+
+    img.src = assets[key];
+  });
+
+  beamSound = new Audio(assets.beamSound);
+  beamSound.volume = 1.0;
+}
+
+async function initAudio() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+
+    const mic = audioCtx.createMediaStreamSource(stream);
+    mic.connect(analyser);
+
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    function detectVoice() {
+      analyser.getByteFrequencyData(data);
+
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        sum += data[i];
+      }
+
+      audioLevel = sum / data.length;
+      smoothedAudioLevel = smoothedAudioLevel * 0.8 + audioLevel * 0.2;
+
+      requestAnimationFrame(detectVoice);
+    }
+
+    detectVoice();
+  } catch (err) {
+    alert("マイクが使えませんでした");
+    console.error(err);
+  }
+}
+
+document.getElementById("start").onclick = () => {
+  loadAssets(async () => {
+    document.getElementById("start").style.display = "none";
+    started = true;
+    resetSpawnTimers();
+    await initAudio();
+  });
+};
+
+c.onmousemove = e => {
+  const rect = c.getBoundingClientRect();
+  mouseX = (e.clientX - rect.left) * (c.width / rect.width);
+};
+
+window.addEventListener("keydown", e => {
+  if (gameOver && (e.key === "r" || e.key === "R")) {
+    resetGame();
+  }
+});
+
+function resetGame() {
+  bullets = [];
+  enemies = [];
+  effects = [];
+  beams = [];
+  mouseX = 200;
+  audioLevel = 0;
+  smoothedAudioLevel = 0;
+  shootCooldown = 0;
+  beamCooldown = 0;
+  score = 0;
+  hp = 3;
+  damageFlash = 0;
+  shake = 0;
+  totalTime = 0;
+  lastTime = 0;
+  gameOver = false;
+  resetSpawnTimers();
+}
+
+function spawnWeakEnemy() {
+  const diff = getDifficulty();
+  enemies.push({
+    type: "weak",
+    x: Math.random() * 340 + 30,
+    y: -30,
+    size: 42,
+    hp: 2,
+    maxHp: 2,
+    speed: 72 + diff * 10
+  });
+}
+
+function spawnStrongEnemy() {
+  const diff = getDifficulty();
+  const maxHp = Math.floor(12 + diff * 2);
+  enemies.push({
+    type: "strong",
+    x: Math.random() * 300 + 50,
+    y: -60,
+    size: 90,
+    hp: maxHp,
+    maxHp: maxHp,
+    speed: 24 + diff * 4
+  });
+}
+
+function spawnSplitEnemy() {
+  const diff = getDifficulty();
+  enemies.push({
+    type: "split",
+    x: Math.random() * 300 + 50,
+    y: -44,
+    size: 70,
+    hp: 4,
+    maxHp: 4,
+    speed: 52 + diff * 6
+  });
+}
+
+function spawnSplitChild(x, y, vx) {
+  const diff = getDifficulty();
+  enemies.push({
+    type: "splitChild",
+    x: x,
+    y: y,
+    size: 30,
+    hp: 1,
+    maxHp: 1,
+    speed: 90 + diff * 4,
+    vx: vx
+  });
+}
+
+function splitIntoThree(e) {
+  spawnSplitChild(e.x - 14, e.y + e.size / 3, -80);
+  spawnSplitChild(e.x,      e.y + e.size / 3,   0);
+  spawnSplitChild(e.x + 14, e.y + e.size / 3,  80);
+}
+
+function createExplosion(x, y, size, color = "cyan") {
+  effects.push({
+    x: x,
+    y: y,
+    r: Math.max(10, size),
+    life: 0.30,
+    maxLife: 0.30,
+    grow: 108,
+    color: color
+  });
+}
+
+function destroyEnemy(ei, e) {
+  createExplosion(e.x, e.y + e.size / 2, e.size * 0.9, "magenta");
+
+  if (e.type === "split") {
+    splitIntoThree(e);
+  }
+
+  enemies.splice(ei, 1);
+  shake = 8;
+
+  if (e.type === "strong") score += 5;
+  else if (e.type === "split") score += 4;
+  else if (e.type === "splitChild") score += 1;
+  else score += 1;
+
+  if (score > highScore) {
+    highScore = score;
+    localStorage.setItem("voiceShootHighScore", highScore);
+  }
+}
+
+function update(dt) {
+  if (!started) return;
+  if (gameOver) return;
+
+  const gameSpeed = 0.7;
+  dt *= gameSpeed;
+
+  totalTime += dt;
+  const diff = getDifficulty();
+
+  shootCooldown = Math.max(0, shootCooldown - dt);
+  beamCooldown = Math.max(0, beamCooldown - dt);
+  damageFlash = Math.max(0, damageFlash - dt);
+
+  if (shake > 0) shake *= Math.pow(0.85, dt * 60);
+  if (shake < 0.5) shake = 0;
+
+  if (beamCooldown === 0 && smoothedAudioLevel > beamAudioLevel) {
+    beams.push({
+      x: mouseX,
+      y: 0,
+      width: 84,
+      height: 560,
+      life: 0.26,
+      tickTimer: 0
+    });
+
+    if (beamSound) {
+      beamSound.currentTime = 0;
+      beamSound.play().catch(() => {});
+    }
+
+    shootCooldown = 1.2;
+    beamCooldown = 1.6;
+    shake = 14;
+
+  } else if (beamCooldown === 0 && smoothedAudioLevel > 7 && shootCooldown === 0) {
+    let bulletSize = 16;
+    let bulletPower = 1;
+    let cooldown = 0.16;
+    let rotateSpeed = 7.2;
+
+    if (smoothedAudioLevel > 20) {
+      bulletSize = 26;
+      bulletPower = 3;
+      cooldown = 0.23;
+      rotateSpeed = 13.2;
+    } else if (smoothedAudioLevel > 12) {
+      bulletSize = 20;
+      bulletPower = 2;
+      cooldown = 0.18;
+      rotateSpeed = 10.2;
+    }
+
+    bullets.push({
+      x: mouseX,
+      y: 545,
+      size: bulletSize,
+      power: bulletPower,
+      speed: 420,
+      angle: 0,
+      rotateSpeed: rotateSpeed
+    });
+
+    shootCooldown = cooldown;
+  }
+
+  bullets.forEach(b => {
+    b.y -= b.speed * dt;
+    b.angle += b.rotateSpeed * dt;
+  });
+
+  beams.forEach(beam => {
+    beam.life -= dt;
+    beam.tickTimer += dt;
+  });
+  beams = beams.filter(beam => beam.life > 0);
+
+  enemies.forEach(e => {
+    if (e.type === "splitChild") {
+      e.y += e.speed * dt;
+      e.x += e.vx * dt;
+
+      if (e.x < 18) {
+        e.x = 18;
+        e.vx = Math.abs(e.vx);
+      }
+      if (e.x > c.width - 18) {
+        e.x = c.width - 18;
+        e.vx = -Math.abs(e.vx);
+      }
+    } else {
+      e.y += e.speed * dt;
+    }
+  });
+
+  for (let ei = enemies.length - 1; ei >= 0; ei--) {
+    const e = enemies[ei];
+
+    for (let bi = bullets.length - 1; bi >= 0; bi--) {
+      const b = bullets[bi];
+
+      const hitX = Math.abs(e.x - b.x) < (e.size / 2 + b.size / 2);
+      const hitY = Math.abs((e.y + e.size / 2) - b.y) < (e.size / 2 + b.size / 2);
+
+      if (hitX && hitY) {
+        e.hp -= b.power;
+        createExplosion(b.x, b.y, b.size * 1.8, "magenta");
+        bullets.splice(bi, 1);
+        shake = 4;
+
+        if (e.hp <= 0) {
+          destroyEnemy(ei, e);
+        }
+        break;
+      }
+    }
+  }
+
+  // ビームは当たったら体力に関係なく即死
+  for (let ei = enemies.length - 1; ei >= 0; ei--) {
+    const e = enemies[ei];
+
+    for (let bi = beams.length - 1; bi >= 0; bi--) {
+      const beam = beams[bi];
+
+      const hitX = Math.abs(e.x - beam.x) < (e.size / 2 + beam.width / 2);
+      const hitY = e.y < beam.height;
+
+      if (hitX && hitY) {
+        createExplosion(e.x, e.y + e.size / 2, e.size * 0.5, "magenta");
+        shake = 6;
+        destroyEnemy(ei, e);
+        break;
+      }
+    }
+  }
+
+  bullets = bullets.filter(b => b.y > -80);
+
+  for (let ei = enemies.length - 1; ei >= 0; ei--) {
+    const e = enemies[ei];
+
+    if (e.y + e.size >= 560) {
+      createExplosion(e.x, 560, e.size * 0.7, "yellow");
+      enemies.splice(ei, 1);
+      hp--;
+      damageFlash = 0.16;
+      shake = 10;
+
+      if (hp <= 0) {
+        gameOver = true;
+
+        if (score > highScore) {
+          highScore = score;
+          localStorage.setItem("voiceShootHighScore", highScore);
+        }
+      }
+    }
+  }
+
+  enemies = enemies.filter(e => e.y < 700);
+
+  effects.forEach(ef => {
+    ef.life -= dt;
+    ef.r += ef.grow * dt;
+  });
+  effects = effects.filter(ef => ef.life > 0);
+
+  weakSpawnTimer -= dt;
+  strongSpawnTimer -= dt;
+  splitSpawnTimer -= dt;
+
+  if (weakSpawnTimer <= 0) {
+    spawnWeakEnemy();
+    const rate = Math.max(0.26, 0.95 - diff * 0.12);
+    weakSpawnTimer = randRange(rate * 0.7, rate);
+  }
+
+  if (strongSpawnTimer <= 0) {
+    spawnStrongEnemy();
+    const rate = Math.max(1.8, 5.0 - diff * 0.8);
+    strongSpawnTimer = randRange(rate * 0.75, rate);
+  }
+
+  if (splitSpawnTimer <= 0) {
+    if (score >= SSpawnScore) {
+      spawnSplitEnemy();
+    }
+
+    const rate = Math.max(2.4, 7.0 - diff * 0.9);
+    splitSpawnTimer = randRange(rate * 0.8, rate);
+  }
+}
+
+function drawBackground() {
+  if (imageLoaded.background && images.background) {
+    ctx.drawImage(images.background, 0, 0, c.width, c.height);
+  } else {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, c.width, c.height);
+  }
+}
+
+function drawPlayer() {
+  if (imageLoaded.player && images.player) {
+    if (beamCooldown > 0) {
+      if (Math.floor(totalTime * 10) % 2 === 0) return;
+    }
+
+    const w = 72;
+    const h = 72;
+    ctx.drawImage(images.player, mouseX - w / 2, 520, w, h);
+  } else {
+    ctx.fillStyle = "#0f0";
+    ctx.fillRect(mouseX - 12, 560, 24, 24);
+  }
+}
+
+function drawBullet(b) {
+  if (imageLoaded.bullet && images.bullet) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(b.angle);
+    ctx.drawImage(images.bullet, -b.size, -b.size, b.size * 2, b.size * 2);
+    ctx.restore();
+  } else {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(b.angle);
+
+    ctx.fillStyle = "#0ff";
+    ctx.beginPath();
+    ctx.arc(0, 0, b.size, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(120, 230, 255, 0.7)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 0, b.size + 5, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
+function drawBeam(beam) {
+  ctx.save();
+
+  ctx.fillStyle = "rgba(255, 80, 220, 0.22)";
+  ctx.fillRect(beam.x - beam.width / 2, beam.y, beam.width, beam.height);
+
+  ctx.fillStyle = "rgba(255, 180, 245, 0.45)";
+  ctx.fillRect(beam.x - beam.width / 4, beam.y, beam.width / 2, beam.height);
+
+  ctx.strokeStyle = "rgba(255, 120, 230, 0.9)";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(beam.x - beam.width / 2, beam.y, beam.width, beam.height);
+
+  ctx.restore();
+}
+
+function drawEnemy(e) {
+  let img = null;
+  let isLoaded = false;
+
+  if (e.type === "strong") {
+    img = images.enemyStrong;
+    isLoaded = imageLoaded.enemyStrong;
+  } else if (e.type === "split") {
+    img = images.enemySplit;
+    isLoaded = imageLoaded.enemySplit;
+  } else {
+    img = images.enemyWeak;
+    isLoaded = imageLoaded.enemyWeak;
+  }
+
+  if (isLoaded && img) {
+    ctx.drawImage(img, e.x - e.size / 2, e.y, e.size, e.size);
+  } else {
+    if (e.type === "split") ctx.fillStyle = "#66ffcc";
+    else if (e.type === "splitChild") ctx.fillStyle = "#f80";
+    else if (e.type === "strong") ctx.fillStyle = "#f00";
+    else ctx.fillStyle = "#f80";
+
+    ctx.fillRect(e.x - e.size / 2, e.y, e.size, e.size);
+  }
+
+  ctx.fillStyle = "#444";
+  ctx.fillRect(e.x - e.size / 2, e.y - 10, e.size, 5);
+
+  ctx.fillStyle = "#0f0";
+  ctx.fillRect(e.x - e.size / 2, e.y - 10, e.size * (e.hp / e.maxHp), 5);
+}
+
+function drawEffect(ef) {
+  const alpha = ef.life / ef.maxLife;
+
+  let stroke1 = "rgba(100, 220, 255, " + alpha + ")";
+  let stroke2 = "rgba(180, 240, 255, " + (alpha * 0.8) + ")";
+  let fill = "rgba(180, 240, 255, " + (alpha * 0.25) + ")";
+
+  if (ef.color === "magenta") {
+    stroke1 = "rgba(255, 80, 220, " + alpha + ")";
+    stroke2 = "rgba(255, 160, 240, " + (alpha * 0.8) + ")";
+    fill = "rgba(255, 120, 230, " + (alpha * 0.25) + ")";
+  }
+
+  if (ef.color === "yellow") {
+    stroke1 = "rgba(255, 220, 60, " + alpha + ")";
+    stroke2 = "rgba(255, 240, 140, " + (alpha * 0.8) + ")";
+    fill = "rgba(255, 230, 100, " + (alpha * 0.25) + ")";
+  }
+
+  ctx.save();
+
+  ctx.strokeStyle = stroke1;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(ef.x, ef.y, ef.r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.strokeStyle = stroke2;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(ef.x, ef.y, ef.r * 0.65, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.fillStyle = fill;
+  ctx.beginPath();
+  ctx.arc(ef.x, ef.y, ef.r * 0.3, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function drawUI() {
+  // 音量メーターを広く
+  ctx.fillStyle = "#666";
+  ctx.fillRect(10, 10, 220, 14);
+
+  ctx.fillStyle = "#ff4fd8";
+  ctx.fillRect(10, 10, Math.min((smoothedAudioLevel/barMaxAudioLevel)*220, 220), 14);
+
+  // ビーム基準線
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(beamAudioLevel/barMaxAudioLevel*220, 8);
+  ctx.lineTo(beamAudioLevel/barMaxAudioLevel*220, 26);
+  ctx.stroke();
+  //220はメータの長さ
+
+  ctx.fillStyle = "#fff";
+  ctx.font = "16px sans-serif";
+  ctx.fillText("SCORE: " + score, 10, 50);
+  ctx.fillText("HIGH: " + highScore, 10, 75);
+  ctx.fillText("HP", 10, 100);
+
+  ctx.fillStyle = "#444";
+  ctx.fillRect(45, 88, 100, 14);
+
+  ctx.fillStyle = "#ffe100";
+  ctx.fillRect(45, 88, (hp / 3) * 100, 14);
+
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(45, 88, 100, 14);
+
+  ctx.fillStyle = "#fff";
+  ctx.fillText("BEAM: " + beamCooldown.toFixed(1), 10, 125);
+
+  if (damageFlash > 0) {
+    ctx.fillStyle = "rgba(255,220,0,0.18)";
+    ctx.fillRect(0, 0, c.width, c.height);
+  }
+
+  if (gameOver) {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+    ctx.fillRect(0, 0, c.width, c.height);
+
+    ctx.fillStyle = "#fff";
+    ctx.font = "32px sans-serif";
+    ctx.fillText("GAME OVER", 95, 260);
+
+    ctx.font = "18px sans-serif";
+    ctx.fillText("SCORE: " + score, 145, 305);
+    ctx.fillText("HIGH: " + highScore, 145, 335);
+    ctx.fillText("Rキーでやり直し", 110, 380);
+  }
+}
+
+function draw() {
+  if (!started) return;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, c.width, c.height);
+
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (shake > 0) {
+    offsetX = (Math.random() - 0.5) * shake;
+    offsetY = (Math.random() - 0.5) * shake;
+  }
+
+  ctx.setTransform(1, 0, 0, 1, offsetX, offsetY);
+
+  drawBackground();
+  drawPlayer();
+  bullets.forEach(drawBullet);
+  beams.forEach(drawBeam);
+  enemies.forEach(drawEnemy);
+  effects.forEach(drawEffect);
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  drawUI();
+}
+
+function loop(timestamp) {
+  if (!lastTime) lastTime = timestamp;
+
+  let dt = (timestamp - lastTime) / 1000;
+  lastTime = timestamp;
+
+  if (dt > 0.05) dt = 0.05;
+
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+
+</body>
+</html>
